@@ -1,0 +1,2 @@
+FROM calciumion/new-api:v1.0.0-rc.44@sha256:67bf271602177ff31bbb4b34f20d5f33003d3108514bd23412cff66498c05a84
+COPY .artifacts/new-api /new-api

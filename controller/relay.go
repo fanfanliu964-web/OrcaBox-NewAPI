@@ -90,7 +90,27 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	defer func() {
 		if newAPIError != nil {
 			service.RecordRequestPolicyTermination(c, newAPIError)
-			logger.LogError(c, common.LogText("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
+			if c.GetBool("orcabox_managed") {
+				// Only local, enumerated classes may enter logs/headers. Supplier
+				// messages and arbitrary supplier error codes can contain secrets.
+				failure := "supplier_or_gateway_error"
+				switch newAPIError.GetErrorCode() {
+				case types.ErrorCodeDoRequestFailed:
+					failure = "supplier_connection_failed"
+				case types.ErrorCodeGetChannelFailed, types.ErrorCodeChannelNoAvailableKey:
+					failure = "channel_unavailable"
+				case types.ErrorCodeReadResponseBodyFailed:
+					failure = "supplier_read_failed"
+				case types.ErrorCodeBadResponseStatusCode:
+					failure = "supplier_status_failed"
+				}
+				c.Header("X-Orcabox-Failure-Class", failure)
+				logger.LogError(c, "managed relay request failed class="+failure)
+				writeManagedRelayError(c, newAPIError.StatusCode, failure, requestId)
+				return
+			} else {
+				logger.LogError(c, common.LogText("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
+			}
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
@@ -205,6 +225,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
 
+		if c.GetBool("orcabox_managed") {
+			break
+		}
 		decision := service.DecideRelayRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry())
 		service.RecordPolicyFailure(c, channel.Id, newAPIError, decision)
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, relayInfo)
@@ -219,6 +242,18 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		retryLogStr := common.LogText("retry: %s", strings.Trim(strings.Join(strings.Fields(fmt.Sprint(useChannel)), "->"), "[]"))
 		logger.LogInfo(c, retryLogStr)
 	}
+}
+
+// A supplier error can echo its credential or parts of the user's request in
+// message, code, param or metadata. None of those fields belong in our reply.
+func writeManagedRelayError(c *gin.Context, status int, failure, requestID string) {
+	if status < 400 || status > 599 {
+		status = http.StatusBadGateway
+	}
+	c.JSON(status, gin.H{"error": gin.H{
+		"message": common.MessageWithRequestId("模型服务暂不可用，请稍后重试；可在使用记录中查看结算状态。", requestID),
+		"type":    "orcabox_error", "code": failure,
+	}})
 }
 
 // CountClaudeTokens implements Anthropic's token-counting utility endpoint.

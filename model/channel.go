@@ -206,7 +206,11 @@ func (channel *Channel) GetKeys() []string {
 func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	// If not in multi-key mode, return the original key string directly.
 	if !channel.ChannelInfo.IsMultiKey {
-		return channel.Key, 0, nil
+		key, err := common.DecryptOrcaboxChannelKey(channel.Key)
+		if err != nil {
+			return "", 0, types.NewError(err, types.ErrorCodeGetChannelFailed)
+		}
+		return key, 0, nil
 	}
 
 	// Obtain all keys (split by \n)
@@ -1193,4 +1197,17 @@ func CountChannelsGroupByType() (map[int64]int64, error) {
 		counts[r.Type] = r.Count
 	}
 	return counts, nil
+}
+
+// Managed single-upstream credentials are never persisted as cleartext.
+func (channel *Channel) BeforeSave(tx *gorm.DB) error {
+	encrypted, err := common.EncryptOrcaboxChannelKey(channel.Key)
+	if err != nil {
+		return err
+	}
+	if encrypted != channel.Key {
+		channel.Key = encrypted
+		tx.Statement.SetColumn("key", encrypted)
+	}
+	return nil
 }
