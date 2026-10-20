@@ -250,7 +250,7 @@ func gateway(c *gin.Context, l *Ledger, p PriceBook) {
 		return
 	}
 	if !a.ExpiresAt.After(l.now()) {
-		errorResponse(c, 403, "套餐已到期")
+		errorResponse(c, 402, "套餐已到期")
 		return
 	}
 	if path == "/v1/models" && c.Request.Method == "GET" {
@@ -378,9 +378,9 @@ func gateway(c *gin.Context, l *Ledger, p PriceBook) {
 		if errors.Is(e, ErrKeyChanged) {
 			errorResponse(c, 401, "Key 已更换，请使用新 Key")
 		} else if errors.Is(e, ErrTestBudget) {
-			errorResponse(c, 403, "真实联调预算已用完，请联系管理员")
+			errorResponse(c, 402, "真实联调预算已用完，请联系管理员")
 		} else if errors.Is(e, ErrFunds) {
-			errorResponse(c, 403, "积分不足或套餐已到期")
+			errorResponse(c, 402, "积分不足或套餐已到期")
 		} else if errors.Is(e, ErrConcurrency) {
 			errorResponse(c, 429, "并发已满，未完成请求正在恢复")
 		} else {
@@ -497,10 +497,13 @@ func validateRequest(b map[string]any, path string, opaqueResolvers ...func(map[
 			for k, v := range x {
 				textBytes += int64(len(k)) + 8
 				if k == "image_url" && (x["type"] == "input_image" || x["type"] == "image_url") {
-					// Verified model/detail sizing: <=2500 patches * 1.2.
-					// https://developers.openai.com/api/docs/guides/images-vision
-					if b["model"] != "gpt-5.6-sol" && b["model"] != "gpt-6-astra" {
-						return errors.New("图片请选用 5.6 Sol 或 6 Astra，其他模型的图片成本仍在核验")
+					// The supplier advertises image input for all four release models.
+					// Retain a conservative per-image reserve for the bounded 16-MP
+					// upload; settlement still uses the supplier's actual token usage.
+					switch b["model"] {
+					case "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra":
+					default:
+						return errors.New("该模型尚未开放图片输入")
 					}
 					url, ok := v.(string)
 					if obj, yes := v.(map[string]any); yes {
@@ -543,7 +546,7 @@ func validateRequest(b map[string]any, path string, opaqueResolvers ...func(map[
 	if images > 4 {
 		return 0, 0, errors.New("每次最多 4 张图片")
 	}
-	tokens := textBytes + images*3000 + opaqueTokens
+	tokens := textBytes + images*24576 + opaqueTokens
 	if tokens > 128000 {
 		return 0, 0, errors.New("内容超过当前输入上限，请缩小图片或文件")
 	}

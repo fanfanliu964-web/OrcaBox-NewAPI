@@ -4,10 +4,37 @@ import (
 	"errors"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestExpiredEntitlementReportsBillingInsteadOfInvalidCredentials(t *testing.T) {
+	l := testLedger(t)
+	now := time.Now().UTC()
+	l.Now = func() time.Time { return now }
+	_, err := l.Grant("expiry-http-order", "buyer", 100, 30)
+	require.NoError(t, err)
+	key, err := l.Key("buyer")
+	require.NoError(t, err)
+	now = now.Add(31 * 24 * time.Hour)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/v1/models", nil)
+	c.Request.Header.Set("Authorization", "Bearer "+key)
+	gateway(c, l, PriceBook{})
+	assert.Equal(t, 402, w.Code)
+
+	w = httptest.NewRecorder()
+	c, _ = gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/v1/models", nil)
+	c.Request.Header.Set("Authorization", "Bearer sk-invalid")
+	gateway(c, l, PriceBook{})
+	assert.Equal(t, 401, w.Code)
+}
 
 func authContext(key string) *gin.Context {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())

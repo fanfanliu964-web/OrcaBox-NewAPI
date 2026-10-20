@@ -3,6 +3,9 @@ package orcabox
 import (
 	"errors"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCompressedImageDecodingIsBoundedAcrossAccounts(t *testing.T) {
@@ -20,17 +23,21 @@ func TestVerifiedImageModelsNormalizeDetailAndSupportFourImages(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		images = append(images, map[string]any{"type": "input_image", "image_url": url, "detail": "original"})
 	}
-	b := map[string]any{"model": "gpt-5.6-sol", "input": []any{map[string]any{"role": "user", "content": images}}}
-	bound, _, e := validateRequest(b, "/v1/responses")
-	if e != nil || bound > 128000 || bound < 12000 {
-		t.Fatal("verified image cost ceiling invalid", e)
+	for _, model := range []string{"gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra"} {
+		t.Run(model, func(t *testing.T) {
+			b := map[string]any{"model": model, "input": []any{map[string]any{"role": "user", "content": images}}}
+			bound, _, err := validateRequest(b, "/v1/responses")
+			require.NoError(t, err)
+			assert.GreaterOrEqual(t, bound, int64(4*24576))
+			assert.LessOrEqual(t, bound+8192, int64(128000))
+		})
 	}
 	for _, image := range images {
 		if image.(map[string]any)["detail"] != "high" {
 			t.Fatal("unbounded original detail forwarded")
 		}
 	}
-	unknown := map[string]any{"model": "gpt-6.1-sol", "input": []any{map[string]any{"type": "input_image", "image_url": url}}}
+	unknown := map[string]any{"model": "unpublished", "input": []any{map[string]any{"type": "input_image", "image_url": url}}}
 	if _, _, e := validateRequest(unknown, "/v1/responses"); e == nil {
 		t.Fatal("unknown image pricing accepted")
 	}
