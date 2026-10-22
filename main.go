@@ -23,6 +23,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
+	"github.com/QuantumNous/new-api/orcabox"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/pkg/wsmanager"
@@ -202,6 +203,10 @@ func main() {
 	InjectGoogleAnalytics()
 
 	// 设置路由
+	if err := orcabox.Install(server); err != nil {
+		common.FatalLog("managed gateway initialization failed")
+		return
+	}
 	router.SetRouter(server, router.WebAssets{
 		BuildFS:   buildFS,
 		IndexPage: indexPage,
@@ -214,6 +219,12 @@ func main() {
 	srv := &http.Server{
 		Addr:    ":" + port,
 		Handler: server,
+	}
+	if os.Getenv("ORCABOX_MANAGED_GATEWAY") == "true" {
+		srv.ReadHeaderTimeout = 5 * time.Second
+		srv.ReadTimeout = 30 * time.Second
+		srv.IdleTimeout = 60 * time.Second
+		srv.MaxHeaderBytes = 32 << 10
 	}
 
 	go func() {
