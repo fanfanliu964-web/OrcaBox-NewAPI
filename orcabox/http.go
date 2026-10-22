@@ -36,7 +36,8 @@ var errImageDecodeBusy = errors.New("图片解析繁忙，请稍后重试")
 const limitScript = `
 redis.call('ZREMRANGEBYSCORE',KEYS[1],'-inf',ARGV[1]-60000)
 redis.call('ZREMRANGEBYSCORE',KEYS[2],'-inf',ARGV[1])
-if redis.call('ZCARD',KEYS[1])>=20 or redis.call('ZCARD',KEYS[2])>=2 then return 0 end
+if redis.call('ZCARD',KEYS[1])>=(tonumber(ARGV[3]) or 20) then return -1 end
+if redis.call('ZCARD',KEYS[2])>=2 then return -2 end
 redis.call('ZADD',KEYS[1],ARGV[1],ARGV[2]..':0')
 redis.call('ZADD',KEYS[2],ARGV[1]+230000,ARGV[2])
 redis.call('EXPIRE',KEYS[1],70)
@@ -46,7 +47,7 @@ const tokenLimitScript = `
 redis.call('ZREMRANGEBYSCORE',KEYS[1],'-inf',ARGV[1]-60000)
 local total=0
 for _,v in ipairs(redis.call('ZRANGE',KEYS[1],0,-1)) do total=total+tonumber(string.match(v,':(%d+)$')) end
-if total+tonumber(ARGV[3])>200000 then return 0 end
+if total+tonumber(ARGV[3])>(tonumber(ARGV[4]) or 200000) then return 0 end
 redis.call('ZREM',KEYS[1],ARGV[2]..':0')
 redis.call('ZADD',KEYS[1],ARGV[1],ARGV[2]..':'..ARGV[3])
 redis.call('EXPIRE',KEYS[1],70)
@@ -62,6 +63,11 @@ func Install(engine *gin.Engine) error {
 	if _, e := testBudgetLimit(); e != nil {
 		return e
 	}
+	limits, e := loadRateLimits()
+	if e != nil {
+		return e
+	}
+	activeRateLimits = limits
 	if len(os.Getenv("ORCABOX_INTERNAL_TOKEN")) < 48 || common.RDB == nil {
 		return errors.New("managed gateway requires internal authentication and Redis")
 	}
@@ -246,7 +252,7 @@ func gateway(c *gin.Context, l *Ledger, p PriceBook) {
 	path := c.Request.URL.Path
 	if path == "/v1/usage" && c.Request.Method == "GET" {
 		l.expire(&a, l.now())
-		c.AbortWithStatusJSON(200, gin.H{"mode": "quota_limited", "unit": "积分", "quota": gin.H{"scope": "key", "limit": float64(a.Available+a.Frozen+a.Used+a.Expired) / float64(Unit), "remaining": float64(a.Available) / float64(Unit)}, "available_units": a.Available, "frozen_units": a.Frozen, "used_units": a.Used, "unit_scale": Unit, "expires_at": a.ExpiresAt})
+		c.AbortWithStatusJSON(200, gin.H{"mode": "quota_limited", "unit": "积分", "quota": gin.H{"scope": "key", "limit": float64(a.Available+a.Frozen+a.Used+a.Expired) / float64(Unit), "remaining": float64(a.Available) / float64(Unit)}, "available_units": a.Available, "frozen_units": a.Frozen, "used_units": a.Used, "unit_scale": Unit, "expires_at": a.ExpiresAt, "limits": gin.H{"rpm": activeRateLimits.RPM, "tpm": activeRateLimits.TPM, "concurrency": 2}})
 		return
 	}
 	if !a.ExpiresAt.After(l.now()) {
@@ -278,14 +284,18 @@ func gateway(c *gin.Context, l *Ledger, p PriceBook) {
 	rk := fmt.Sprintf("orcabox:rate:%d", a.ID)
 	ck := fmt.Sprintf("orcabox:active:%d", a.ID)
 	leaseCtx, leaseCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	limit, e := common.RDB.Eval(leaseCtx, limitScript, []string{rk, ck}, time.Now().UnixMilli(), id).Int()
+	limit, e := common.RDB.Eval(leaseCtx, limitScript, []string{rk, ck}, time.Now().UnixMilli(), id, activeRateLimits.RPM).Int()
 	leaseCancel()
 	if e != nil {
 		errorResponse(c, 503, "限流服务暂不可用")
 		return
 	}
 	if limit != 1 {
-		errorResponse(c, 429, "请求过于频繁或并发已满")
+		if limit == -1 {
+			rateLimitResponse(c, a.ID, "account_rpm", "本站每分钟请求次数已达上限，请稍后重试", 60)
+		} else {
+			rateLimitResponse(c, a.ID, "account_concurrency", "本站账号已有两个请求正在处理，请等待回答完成", 2)
+		}
 		return
 	}
 	defer func() {
@@ -298,7 +308,7 @@ func gateway(c *gin.Context, l *Ledger, p PriceBook) {
 		case largePayloadSlots <- struct{}{}:
 			defer func() { <-largePayloadSlots }()
 		default:
-			errorResponse(c, 429, "图片与大文件请求繁忙，请稍后重试")
+			rateLimitResponse(c, a.ID, "payload_busy", "本站图片与大文件处理繁忙，请稍后重试", 2)
 			return
 		}
 	}
@@ -327,7 +337,7 @@ func gateway(c *gin.Context, l *Ledger, p PriceBook) {
 	})
 	if e != nil {
 		if errors.Is(e, errImageDecodeBusy) {
-			errorResponse(c, 429, e.Error())
+			rateLimitResponse(c, a.ID, "image_decode_busy", "本站图片解析繁忙，请稍后重试", 2)
 			return
 		}
 		errorResponse(c, 400, e.Error())
@@ -352,15 +362,27 @@ func gateway(c *gin.Context, l *Ledger, p PriceBook) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 180*time.Second)
 	defer cancel()
 	c.Request = c.Request.WithContext(ctx)
-	limit, e = common.RDB.Eval(ctx, tokenLimitScript, []string{rk}, time.Now().UnixMilli(), id, tokens+maxOut).Int()
+	limit, e = common.RDB.Eval(ctx, tokenLimitScript, []string{rk}, time.Now().UnixMilli(), id, tokens+maxOut, activeRateLimits.TPM).Int()
 	if e != nil {
 		errorResponse(c, 503, "限流服务暂不可用")
 		return
 	}
 	if limit != 1 {
-		errorResponse(c, 429, "请求过于频繁或并发已满")
+		rateLimitResponse(c, a.ID, "account_tpm", "本站一分钟内的 Token 用量与处理中请求预留已达上限，请稍后重试", 60)
 		return
 	}
+	var capture *usageCapture
+	defer func() {
+		var usage *Usage
+		if capture != nil {
+			usage = capture.usage
+		}
+		rateCtx, rateCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer rateCancel()
+		if err := reconcileRateUsage(rateCtx, common.RDB, rk, id, tokens+maxOut, usage, c.GetBool("orcabox_forwarded"), time.Now().UnixMilli()); err != nil {
+			common.SysLog("orcabox token-rate reconciliation unavailable")
+		}
+	}()
 	// Reserve at the most expensive input category; cached input can only cost less.
 	reserveRate := rate
 	for _, v := range []string{rate.CacheWrite, rate.CacheRead} {
@@ -382,7 +404,7 @@ func gateway(c *gin.Context, l *Ledger, p PriceBook) {
 		} else if errors.Is(e, ErrFunds) {
 			errorResponse(c, 402, "积分不足或套餐已到期")
 		} else if errors.Is(e, ErrConcurrency) {
-			errorResponse(c, 429, "并发已满，未完成请求正在恢复")
+			rateLimitResponse(c, a.ID, "account_concurrency", "本站账号的未完成请求正在恢复，请稍后重试", 2)
 		} else {
 			errorResponse(c, 503, "账务服务暂不可用")
 		}
@@ -390,7 +412,7 @@ func gateway(c *gin.Context, l *Ledger, p PriceBook) {
 	}
 	c.Header("X-Orcabox-Request-Id", req.ID)
 	c.Set(Managed, true)
-	capture := &usageCapture{}
+	capture = &usageCapture{}
 	capture.onUsage = func(u *Usage) {
 		if e := l.DurableSettle(req.ID, *u, rate, capture.metadata()); e != nil {
 			common.SysLog("orcabox durable settlement pending")
